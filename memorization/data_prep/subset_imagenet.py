@@ -9,8 +9,10 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import ImageFolder
 from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as T
+from torchvision.transforms import InterpolationMode
 from pathlib import Path
 from torch.utils.data import Subset
+from utils.data import normalize_01_into_pm1
 
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -21,18 +23,28 @@ def build_imagenet_dataset(
     root: str = "/scratch/inf0/user/mparcham/ILSVRC2012",
     split: str = "val",                  # "train" or "val"
     transform: T.Compose | None = None,
+    final_reso: int = 256,
+    mid_reso: float = 1.125,
 ):
     """
-    Build an ImageFolder dataset for ImageNet and return:
-    - dataset: torchvision.datasets.ImageFolder with provided transform
-    - class_to_indices: dict[label] -> list of sample indices belonging to that class
+    Build an ImageFolder dataset for ImageNet with VAR-style preprocessing.
+
+    Transform (if not provided) follows the VAR setting:
+      - Resize the shorter edge to round(mid_reso * final_reso) with LANCZOS
+      - RandomCrop to (final_reso, final_reso)
+      - ToTensor, then normalize from [0,1] to [-1,1] via normalize_01_into_pm1
+
+    Note: We intentionally use RandomCrop for both train/val here to enable
+    sampling multiple random crops per image downstream for robust activation
+    estimation.
     """
     if transform is None:
+        mid_px = round(mid_reso * final_reso)
         transform = T.Compose([
-            T.Resize(256),
-            T.CenterCrop(256),
+            T.Resize(mid_px, interpolation=InterpolationMode.LANCZOS),
+            T.RandomCrop((final_reso, final_reso)),
             T.ToTensor(),
-            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+            normalize_01_into_pm1,
         ])
 
     dataset = ImageFolder(root=os.path.join(root, split), transform=transform)
@@ -84,7 +96,7 @@ def get_balanced_subset(
 def get_balanced_imagenet_dataset(
     root: str = "/scratch/inf0/user/mparcham/ILSVRC2012",
     split: str = "val",                  # "train" or "val"
-    total_samples: int = 5000,           # REQUIRED COUNT
+    total_samples: int = 12800,           # 1% if imagenet training set
     shuffle: bool = True,
     seed: int = 0,
 ):

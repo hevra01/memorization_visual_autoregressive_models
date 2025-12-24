@@ -14,6 +14,7 @@ from typing import List, Tuple
 
 import torch
 from torch.utils.data import DataLoader
+import wandb
 
 # Ensure project root in sys.path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -23,20 +24,33 @@ if PROJECT_ROOT not in sys.path:
 from models import build_vae_var
 from memorization.data_prep.subset_imagenet import get_balanced_imagenet_dataset
 
+def model_size_gb(model):
+    total_bytes = 0
+    for p in model.parameters():
+        total_bytes += p.numel() * p.element_size()
+    return total_bytes / (1024 ** 3)
 
 def parse_args():
     p = argparse.ArgumentParser(description="Prepare VAR activations for UnitMem")
     p.add_argument("--split", type=str, default="val_categorized", help="Dataset split (e.g., train, val, val_categorized)")
-    p.add_argument("--batch_size", type=int, default=8, help="DataLoader batch size")
-    p.add_argument("--output_dir", type=str, required=True, help="Directory to store activation files")
+    p.add_argument("--batch_size", type=int, default=20, help="DataLoader batch size")
+    p.add_argument("--output_dir", type=str, default="output_activations", help="Directory to store activation files")
     p.add_argument("--model_depth", type=int, default=16, help="VAR depth (num blocks)")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--run_number", type=int, default=0, help="Unique run number identifier passed from Slurm script")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # Setup wandb
+    # Initialize Weights & Biases for logging
+    wandb.init(project="VaR_memorization", name="test_run")
+    
+    # Log all arguments, including run_number, for reproducibility
+    wandb.config.update(args)
 
     # ---------------------------
     # Build and load models
@@ -61,6 +75,19 @@ def main():
     for p in vae.parameters(): p.requires_grad_(False)
     for p in var.parameters(): p.requires_grad_(False)
 
+    # Model summary
+    total_params_var = sum(p.numel() for p in var.parameters())
+    total_params_vae = sum(p.numel() for p in vae.parameters())
+    vae_model_size_gb = model_size_gb(vae)
+    var_model_size_gb = model_size_gb(var)
+    total_model_size_gb = vae_model_size_gb + var_model_size_gb
+
+    print(f"VAE model has {total_params_vae/1e6:.2f}M parameters.")
+    print(f"VAR model with depth {args.model_depth} has {total_params_var/1e6:.2f}M parameters.")
+    print(f"VAE model size: {vae_model_size_gb:.2f} GB")
+    print(f"VAR model size: {var_model_size_gb:.2f} GB")
+    print(f"Total model size: {total_model_size_gb:.2f} GB")
+
     # ---------------------------
     # Dataset
     # ---------------------------
@@ -81,7 +108,8 @@ def main():
     per_block_v    = [[] for _ in range(num_blocks)]
 
     # ---------------------------
-    # Temporary hook buffers
+    # Temporary hook buffers:
+    # 
     # ---------------------------
     fc1_batch_acts  = [[] for _ in range(num_blocks)]
     fc2_batch_acts  = [[] for _ in range(num_blocks)]
@@ -94,13 +122,15 @@ def main():
     # Hooks
     # ---------------------------
     def make_fc1_hook(bi):
-        return lambda m, i, o: fc1_batch_acts[bi].append(o.detach())
+        # lambda is a function that takes (module, input, output) and appends output.detach() to a list.
+        # note: activations can stay in CPU.
+        return lambda module, input, output: fc1_batch_acts[bi].append(output.detach().cpu())
 
     def make_fc2_hook(bi):
-        return lambda m, i, o: fc2_batch_acts[bi].append(o.detach())
+        return lambda module, input, output: fc2_batch_acts[bi].append(output.detach().cpu())
 
     def make_attn_proj_hook(bi):
-        return lambda m, i, o: attn_batch_acts[bi].append(o.detach())
+        return lambda module, input, output: attn_batch_acts[bi].append(output.detach().cpu())
 
     def make_attn_qkv_hook(bi):
         def hook(module, inp, out):
@@ -112,9 +142,9 @@ def main():
             B, L, _ = qkv.shape
             qkv = qkv.view(B, L, 3, module.num_heads, module.head_dim)
             q, k, v = qkv.unbind(dim=2)
-            q_batch_acts[bi].append(q.reshape(B, L, -1).detach())
-            k_batch_acts[bi].append(k.reshape(B, L, -1).detach())
-            v_batch_acts[bi].append(v.reshape(B, L, -1).detach())
+            q_batch_acts[bi].append(q.reshape(B, L, -1).detach().cpu())
+            k_batch_acts[bi].append(k.reshape(B, L, -1).detach().cpu())
+            v_batch_acts[bi].append(v.reshape(B, L, -1).detach().cpu())
         return hook
 
     # Registering the hooks: each block gets 4 hooks.
@@ -163,7 +193,15 @@ def main():
             # Forward pass (teacher forcing), where the activations are captured by hooks.
             _ = var(label_B=labels, x_BLCv_wo_first_l=emb)
 
+            # the activations for ffc1, fc2, attn_proj, q, k, v are
+            # present for each block and we need to store them separately because memorization in a particular
+            # neuron at a particular block might be different than the one at another block.
             for bi in range(num_blocks):
+                # aggregate_over_scales goes from (batch size, total number of tokens, hidden dimension)
+                # into (batch size, number of scales, hidden dimension). Same scale tokens are averaged.
+
+                # we are appending, hence we get a list of batch_size tensors per block,
+                # later we will concat them along dim=0 to get (dataset size, number of scales, hidden dimension).
                 per_block_fc1[bi].append(aggregate_over_scales(fc1_batch_acts[bi].pop(0)))
                 per_block_fc2[bi].append(aggregate_over_scales(fc2_batch_acts[bi].pop(0)))
                 per_block_attn[bi].append(aggregate_over_scales(attn_batch_acts[bi].pop(0)))
@@ -172,9 +210,10 @@ def main():
                 per_block_v[bi].append(aggregate_over_scales(v_batch_acts[bi].pop(0)))
 
     # ---------------------------
-    # Final stacking
+    # Final stacking: Batches are merged within each block "torch.cat(v, 0)". 
+    # and then blocks are stacked (concatenated along dim=0).
     # ---------------------------
-    fc1_all  = torch.stack([torch.cat(v, 0) for v in per_block_fc1], 0)
+    fc1_all  = torch.stack([torch.cat(v, 0) for v in per_block_fc1], 0) # fc1_all[block_id, image_id, scale_id, channel]
     fc2_all  = torch.stack([torch.cat(v, 0) for v in per_block_fc2], 0)
     attn_all = torch.stack([torch.cat(v, 0) for v in per_block_attn], 0)
     q_all    = torch.stack([torch.cat(v, 0) for v in per_block_q], 0)
@@ -184,12 +223,15 @@ def main():
     # ---------------------------
     # Save
     # ---------------------------
-    torch.save(fc1_all,  os.path.join(args.output_dir, "activations_fc1.pt"))
-    torch.save(fc2_all,  os.path.join(args.output_dir, "activations_fc2.pt"))
-    torch.save(attn_all, os.path.join(args.output_dir, "activations_attn_proj.pt"))
-    torch.save(q_all,    os.path.join(args.output_dir, "activations_q.pt"))
-    torch.save(k_all,    os.path.join(args.output_dir, "activations_k.pt"))
-    torch.save(v_all,    os.path.join(args.output_dir, "activations_v.pt"))
+    # create output directory if it doesn't exist
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+    torch.save(fc1_all,  os.path.join(args.output_dir, f"activations_fc1{args.run_number}.pt"))
+    torch.save(fc2_all,  os.path.join(args.output_dir, f"activations_fc2{args.run_number}.pt"))
+    torch.save(attn_all, os.path.join(args.output_dir, f"activations_attn_proj{args.run_number}.pt"))
+    torch.save(q_all,    os.path.join(args.output_dir, f"activations_q{args.run_number}.pt"))
+    torch.save(k_all,    os.path.join(args.output_dir, f"activations_k{args.run_number}.pt"))
+    torch.save(v_all,    os.path.join(args.output_dir, f"activations_v{args.run_number}.pt"))
 
     for h in handles:
         h.remove()
