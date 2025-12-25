@@ -18,3 +18,8 @@ local_output*
 *.log
 *.txt
 *.ipynb
+
+# Ignore output activations (relative to repo root)
+memorization/output_activations/*
+
+memorization/wandb

@@ -33,8 +33,8 @@ def model_size_gb(model):
 def parse_args():
     p = argparse.ArgumentParser(description="Prepare VAR activations for UnitMem")
     p.add_argument("--split", type=str, default="val_categorized", help="Dataset split (e.g., train, val, val_categorized)")
-    p.add_argument("--batch_size", type=int, default=20, help="DataLoader batch size")
-    p.add_argument("--output_dir", type=str, default="output_activations", help="Directory to store activation files")
+    p.add_argument("--batch_size", type=int, default=80, help="DataLoader batch size")
+    p.add_argument("--output_dir", type=str, default="/scratch/inf0/user/hpetekka/var_mem/output_activations", help="Directory to store activation files")
     p.add_argument("--model_depth", type=int, default=16, help="VAR depth (num blocks)")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--run_number", type=int, default=0, help="Unique run number identifier passed from Slurm script")
@@ -98,20 +98,11 @@ def main():
     begin_ends = var.begin_ends  # token ranges per scale
 
     # ---------------------------
-    # Storage: append per *batch*
-    # ---------------------------
-    per_block_fc1  = [[] for _ in range(num_blocks)]
-    per_block_fc2  = [[] for _ in range(num_blocks)]
-    per_block_attn = [[] for _ in range(num_blocks)]
-    per_block_q    = [[] for _ in range(num_blocks)]
-    per_block_k    = [[] for _ in range(num_blocks)]
-    per_block_v    = [[] for _ in range(num_blocks)]
-
-    # ---------------------------
     # Temporary hook buffers:
     # 
     # ---------------------------
     fc1_batch_acts  = [[] for _ in range(num_blocks)]
+    fc1_act_batch_acts  = [[] for _ in range(num_blocks)]
     fc2_batch_acts  = [[] for _ in range(num_blocks)]
     attn_batch_acts = [[] for _ in range(num_blocks)]
     q_batch_acts    = [[] for _ in range(num_blocks)]
@@ -124,13 +115,18 @@ def main():
     def make_fc1_hook(bi):
         # lambda is a function that takes (module, input, output) and appends output.detach() to a list.
         # note: activations can stay in CPU.
-        return lambda module, input, output: fc1_batch_acts[bi].append(output.detach().cpu())
+        return lambda module, input, output: fc1_batch_acts[bi].append(output.detach().to(torch.float16).cpu())
+    
+    def make_fc1_act_hook(bi):
+        # lambda is a function that takes (module, input, output) and appends output.detach() to a list.
+        # note: activations can stay in CPU.
+        return lambda module, input, output: fc1_act_batch_acts[bi].append(output.detach().to(torch.float16).cpu())
 
     def make_fc2_hook(bi):
-        return lambda module, input, output: fc2_batch_acts[bi].append(output.detach().cpu())
+        return lambda module, input, output: fc2_batch_acts[bi].append(output.detach().to(torch.float16).cpu())
 
     def make_attn_proj_hook(bi):
-        return lambda module, input, output: attn_batch_acts[bi].append(output.detach().cpu())
+        return lambda module, input, output: attn_batch_acts[bi].append(output.detach().to(torch.float16).cpu())
 
     def make_attn_qkv_hook(bi):
         def hook(module, inp, out):
@@ -142,9 +138,9 @@ def main():
             B, L, _ = qkv.shape
             qkv = qkv.view(B, L, 3, module.num_heads, module.head_dim)
             q, k, v = qkv.unbind(dim=2)
-            q_batch_acts[bi].append(q.reshape(B, L, -1).detach().cpu())
-            k_batch_acts[bi].append(k.reshape(B, L, -1).detach().cpu())
-            v_batch_acts[bi].append(v.reshape(B, L, -1).detach().cpu())
+            q_batch_acts[bi].append(q.reshape(B, L, -1).detach().to(torch.float16).cpu())
+            k_batch_acts[bi].append(k.reshape(B, L, -1).detach().to(torch.float16).cpu())
+            v_batch_acts[bi].append(v.reshape(B, L, -1).detach().to(torch.float16).cpu())
         return hook
 
     # Registering the hooks: each block gets 4 hooks.
@@ -153,6 +149,7 @@ def main():
     for bi, blk in enumerate(var.blocks):
         handles += [
             blk.ffn.fc1.register_forward_hook(make_fc1_hook(bi)),
+            blk.ffn.fc1.register_forward_hook(make_fc1_act_hook(bi)),
             blk.ffn.fc2.register_forward_hook(make_fc2_hook(bi)),
             blk.attn.proj.register_forward_hook(make_attn_proj_hook(bi)),
             blk.attn.register_forward_hook(make_attn_qkv_hook(bi)),
@@ -174,12 +171,43 @@ def main():
             [x[:, bg:ed].mean(dim=1) for (bg, ed) in begin_ends],
             dim=1
         )
+    
+    fc_1_folder = os.path.join(args.output_dir, f"{args.run_number}/fc1")
+    os.makedirs(fc_1_folder, exist_ok=True)
+
+    fc1_act_folder = os.path.join(args.output_dir, f"{args.run_number}/fc1_act")
+    os.makedirs(fc1_act_folder, exist_ok=True)
+
+    fc_2_folder = os.path.join(args.output_dir, f"{args.run_number}/fc2")
+    os.makedirs(fc_2_folder, exist_ok=True)
+
+    attn_folder = os.path.join(args.output_dir, f"{args.run_number}/attn_proj")
+    os.makedirs(attn_folder, exist_ok=True)
+
+    q_folder = os.path.join(args.output_dir, f"{args.run_number}/q")
+    os.makedirs(q_folder, exist_ok=True)
+
+    k_folder = os.path.join(args.output_dir, f"{args.run_number}/k")
+    os.makedirs(k_folder, exist_ok=True)
+    
+    v_folder = os.path.join(args.output_dir, f"{args.run_number}/v")
+    os.makedirs(v_folder, exist_ok=True)
+
+    # create sub-folders for each block
+    for bi in range(num_blocks):
+        os.makedirs(os.path.join(fc_1_folder, f"block_{bi}"), exist_ok=True)
+        os.makedirs(os.path.join(fc1_act_folder, f"block_{bi}"), exist_ok=True)
+        os.makedirs(os.path.join(fc_2_folder, f"block_{bi}"), exist_ok=True)
+        os.makedirs(os.path.join(attn_folder, f"block_{bi}"), exist_ok=True)
+        os.makedirs(os.path.join(q_folder, f"block_{bi}"), exist_ok=True)
+        os.makedirs(os.path.join(k_folder, f"block_{bi}"), exist_ok=True)
+        os.makedirs(os.path.join(v_folder, f"block_{bi}"), exist_ok=True)
 
     # ---------------------------
     # Main loop
     # ---------------------------
     with torch.no_grad():
-        for images, labels in loader:
+        for batch_idx, (images, labels) in enumerate(loader):
             images = images.to(args.device)
             labels = labels.to(args.device)
 
@@ -202,36 +230,35 @@ def main():
 
                 # we are appending, hence we get a list of batch_size tensors per block,
                 # later we will concat them along dim=0 to get (dataset size, number of scales, hidden dimension).
-                per_block_fc1[bi].append(aggregate_over_scales(fc1_batch_acts[bi].pop(0)))
-                per_block_fc2[bi].append(aggregate_over_scales(fc2_batch_acts[bi].pop(0)))
-                per_block_attn[bi].append(aggregate_over_scales(attn_batch_acts[bi].pop(0)))
-                per_block_q[bi].append(aggregate_over_scales(q_batch_acts[bi].pop(0)))
-                per_block_k[bi].append(aggregate_over_scales(k_batch_acts[bi].pop(0)))
-                per_block_v[bi].append(aggregate_over_scales(v_batch_acts[bi].pop(0)))
+                torch.save(
+                    aggregate_over_scales(fc1_batch_acts[bi].pop(0)),
+                    f"{fc_1_folder}/block_{bi}/batch{batch_idx}.pt"
+                )
+                torch.save(
+                    aggregate_over_scales(fc1_act_batch_acts[bi].pop(0)),
+                    f"{fc1_act_folder}/block_{bi}/batch{batch_idx}.pt"
+                )
+                torch.save(
+                    aggregate_over_scales(fc2_batch_acts[bi].pop(0)),
+                    f"{fc_2_folder}/block_{bi}/batch{batch_idx}.pt"
+                )
+                torch.save(
+                    aggregate_over_scales(attn_batch_acts[bi].pop(0)),
+                    f"{attn_folder}/block_{bi}/batch{batch_idx}.pt"
+                )
+                torch.save(
+                    aggregate_over_scales(q_batch_acts[bi].pop(0)),
+                    f"{q_folder}/block_{bi}/batch{batch_idx}.pt"
+                )
+                torch.save(
+                    aggregate_over_scales(k_batch_acts[bi].pop(0)),
+                    f"{k_folder}/block_{bi}/batch{batch_idx}.pt"
+                )
+                torch.save(
+                    aggregate_over_scales(v_batch_acts[bi].pop(0)),
+                    f"{v_folder}/block_{bi}/batch{batch_idx}.pt"
+                )
 
-    # ---------------------------
-    # Final stacking: Batches are merged within each block "torch.cat(v, 0)". 
-    # and then blocks are stacked (concatenated along dim=0).
-    # ---------------------------
-    fc1_all  = torch.stack([torch.cat(v, 0) for v in per_block_fc1], 0) # fc1_all[block_id, image_id, scale_id, channel]
-    fc2_all  = torch.stack([torch.cat(v, 0) for v in per_block_fc2], 0)
-    attn_all = torch.stack([torch.cat(v, 0) for v in per_block_attn], 0)
-    q_all    = torch.stack([torch.cat(v, 0) for v in per_block_q], 0)
-    k_all    = torch.stack([torch.cat(v, 0) for v in per_block_k], 0)
-    v_all    = torch.stack([torch.cat(v, 0) for v in per_block_v], 0)
-
-    # ---------------------------
-    # Save
-    # ---------------------------
-    # create output directory if it doesn't exist
-    if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
-    torch.save(fc1_all,  os.path.join(args.output_dir, f"activations_fc1{args.run_number}.pt"))
-    torch.save(fc2_all,  os.path.join(args.output_dir, f"activations_fc2{args.run_number}.pt"))
-    torch.save(attn_all, os.path.join(args.output_dir, f"activations_attn_proj{args.run_number}.pt"))
-    torch.save(q_all,    os.path.join(args.output_dir, f"activations_q{args.run_number}.pt"))
-    torch.save(k_all,    os.path.join(args.output_dir, f"activations_k{args.run_number}.pt"))
-    torch.save(v_all,    os.path.join(args.output_dir, f"activations_v{args.run_number}.pt"))
 
     for h in handles:
         h.remove()
