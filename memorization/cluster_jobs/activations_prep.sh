@@ -12,7 +12,7 @@
 
 #SBATCH --partition gpu22              # Partition to submit to (e.g., gpu24 is H100, 80GB VRAM)
 #SBATCH --gres gpu:1                  # Request 1 GPU
-#SBATCH --mem 100G                      # Amount of RAM to allocate
+#SBATCH --mem 80G                      # Amount of RAM to allocate
 #SBATCH --cpus-per-task 4              # Number of CPU cores to allocate
 #SBATCH --time 0-03:00:00              # Max wall time for the job (2 days)
 #SBATCH --nodes 1                      # Number of nodes (machines)
@@ -28,12 +28,12 @@ source /BS/data_mani_compress/work/miniforge3/etc/profile.d/conda.sh
 conda activate var_mem
 
 # Load W&B secrets (make sure this file is secure and not shared)
-source /BS/data_mani_compress/work/VAR/.wandb_secrets.sh
+source /BS/scene_repre/work/VAR/.wandb_secrets.sh
 
 # ---------------- Run your code ---------------- #
 
 # Move to your working directory (adjust this to where your code lives)
-cd /BS/data_mani_compress/work/VAR/memorization/
+cd /BS/scene_repre/work/VAR/memorization/
 
 # Determine run number from Slurm array index if present,
 # otherwise use optional positional argument.
@@ -41,5 +41,4 @@ cd /BS/data_mani_compress/work/VAR/memorization/
 # - Positional fallback: sbatch memorization/cluster_jobs/activations_prep.sh 3
 # ${VAR:-DEFAULT}
 RUN_NUMBER=${SLURM_ARRAY_TASK_ID:-${1:-0}}
-
-python activation_prep.py --run_number "$RUN_NUMBER"
+python activation_prep_temp.py --run_number "$RUN_NUMBER"

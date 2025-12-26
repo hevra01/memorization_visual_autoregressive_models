@@ -1,11 +1,9 @@
-#!/usr/bin/env python3
 """
-Prepare per-scale transformer activations across the dataset for VAR.
-- Hooks on MLP fc1, MLP fc2, and Self-Attention proj layers.
-- Aggregates average activations over tokens for each scale.
-- Saves results per head/module to separate output files.
-
-Final saved tensor shapes: (num_blocks, dataset_size, num_scales, hidden_dim)
+1) Save the activations of various components of VAR model: fc1, fc1_act, fc2, attn_proj, q, k, v.
+2) This file is run as a Slurm job array, where each job processes the entire subset (12800 samples, 1% of imagenet trainset) but with 
+   different augmentations (10 augmentations total). 
+3) It saves the activations per batch, per block, per component due to limited storage.
+4) Later, another script (combine_batches_of_activations.py) will combine the batches altogether.
 """
 import os
 import sys
@@ -33,8 +31,8 @@ def model_size_gb(model):
 def parse_args():
     p = argparse.ArgumentParser(description="Prepare VAR activations for UnitMem")
     p.add_argument("--split", type=str, default="val_categorized", help="Dataset split (e.g., train, val, val_categorized)")
-    p.add_argument("--batch_size", type=int, default=80, help="DataLoader batch size")
-    p.add_argument("--output_dir", type=str, default="/scratch/inf0/user/hpetekka/var_mem/output_activations", help="Directory to store activation files")
+    p.add_argument("--batch_size", type=int, default=110, help="DataLoader batch size")
+    p.add_argument("--output_dir", type=str, default="/scratch/inf0/user/hpetekka/var_mem/output_activations_corrected_xzy/", help="Directory to store activation files")
     p.add_argument("--model_depth", type=int, default=16, help="VAR depth (num blocks)")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--run_number", type=int, default=0, help="Unique run number identifier passed from Slurm script")
@@ -60,6 +58,7 @@ def main():
         V=4096, Cvae=32, ch=160, share_quant_resi=4,
         device=args.device, patch_nums=patch_nums,
         num_classes=1000, depth=args.model_depth, shared_aln=False,
+        flash_if_available=False, fused_if_available=False
     )
 
     vae.load_state_dict(torch.load(
@@ -149,7 +148,7 @@ def main():
     for bi, blk in enumerate(var.blocks):
         handles += [
             blk.ffn.fc1.register_forward_hook(make_fc1_hook(bi)),
-            blk.ffn.fc1.register_forward_hook(make_fc1_act_hook(bi)),
+            blk.ffn.act.register_forward_hook(make_fc1_act_hook(bi)),
             blk.ffn.fc2.register_forward_hook(make_fc2_hook(bi)),
             blk.attn.proj.register_forward_hook(make_attn_proj_hook(bi)),
             blk.attn.register_forward_hook(make_attn_qkv_hook(bi)),
@@ -168,7 +167,7 @@ def main():
         """
         # x: (B, L, C) → (B, S, C)
         return torch.stack(
-            [x[:, bg:ed].mean(dim=1) for (bg, ed) in begin_ends],
+            [x[:, bg:ed].abs().mean(dim=1) for (bg, ed) in begin_ends],
             dim=1
         )
     

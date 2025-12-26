@@ -17,7 +17,6 @@ local_output*
 *.ckpt
 *.log
 *.txt
-*.ipynb
 
 # Ignore output activations (relative to repo root)
 memorization/output_activations/*

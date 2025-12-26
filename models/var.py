@@ -102,13 +102,18 @@ class VAR(nn.Module):
             end='\n\n', flush=True
         )
         
-        # 5. attention mask used in training (for masking out the future)
-        #    it won't be used in inference, since kv cache is enabled
+        # 5. attention mask used in training
+        #    Enforce per-level causality: a query at level s may attend only to keys at level s-1.
+        #    For level-0 queries, allow attention within level 0 (start tokens) to avoid empty-softmax rows.
+        #    This mask is not used in inference; kv cache is enabled there.
         d: torch.Tensor = torch.cat([torch.full((pn*pn,), i) for i, pn in enumerate(self.patch_nums)]).view(1, self.L, 1)
         dT = d.transpose(1, 2)    # dT: 11L
         lvl_1L = dT[:, 0].contiguous()
         self.register_buffer('lvl_1L', lvl_1L)
-        attn_bias_for_masking = torch.where(d >= dT, 0., -torch.inf).reshape(1, 1, self.L, self.L)
+        prev_lvl = (d == (dT + 1))                # keys at level s-1
+        first_lvl = (d == 0) & (dT == 0)          # level-0 queries attend to level-0 keys
+        mask_bool = prev_lvl | first_lvl
+        attn_bias_for_masking = torch.where(mask_bool, 0., -torch.inf).reshape(1, 1, self.L, self.L)
         self.register_buffer('attn_bias_for_masking', attn_bias_for_masking.contiguous())
         
         # 6. classifier head
