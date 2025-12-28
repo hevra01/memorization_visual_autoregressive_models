@@ -50,11 +50,11 @@ def compute_unitmem(mean_max_activations_dict, eps=1e-8):
 
 def main():
     mean_activation_over_augmentations_dir = (
-        "/scratch/inf0/user/hpetekka/var_mem/output_activations_corrected_abs/mean"
+        "/scratch/inf0/user/hpetekka/var_mem/output_activations_corrected_test/combined"
     )
 
     keys = ["fc1", "fc1_act", "fc2", "q", "k", "v", "attn_proj"]
-
+    keys = ["fc1_act"]
     # Structure:
     # mean_max_activations_dict[key][block][scale] -> (C, 2) [max, mean]
     mean_max_activations_dict = {
@@ -71,7 +71,7 @@ def main():
             )
 
             # shape: (N=12800, S=10, C)
-            current_activation = torch.load(current_file).float()
+            current_activation = torch.load(current_file)["activations"].float()
 
             for scale in range(10):
                 scale_act = current_activation[:, scale, :] # (N, C)
@@ -99,8 +99,8 @@ def main():
         eps=1e-8
     )
 
-    torch.save(unitmem_dict, "unitmem_scores_corrected_abs.pt")
-    print("Saved UnitMem scores to unitmem_scores_corrected_abs.pt")
+    torch.save(unitmem_dict, "unitmem_scores_corrected.pt")
+    print("Saved UnitMem scores to unitmem_scores_corrected.pt")
     
 if __name__ == "__main__":
     main()

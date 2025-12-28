@@ -30,7 +30,7 @@ def main():
             current_activation = []
             for i in range(10):
                 current_file = os.path.join(augmented_activation_base_dir, str(i), key, f"block_{j}_combined.pt")
-                current_activation.append(torch.load(current_file).float())
+                current_activation.append(torch.load(current_file).float().abs())
             
             shapes = [x.shape for x in current_activation]
             assert len(set(shapes)) == 1, f"Shape mismatch for {key}, block {j}: {shapes}"

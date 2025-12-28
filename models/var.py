@@ -106,6 +106,7 @@ class VAR(nn.Module):
         #    Enforce per-level causality: a query at level s may attend only to keys at level s-1.
         #    For level-0 queries, allow attention within level 0 (start tokens) to avoid empty-softmax rows.
         #    This mask is not used in inference; kv cache is enabled there.
+        # d: torch.Size([1, 680, 1]) assigns level indices to each token
         d: torch.Tensor = torch.cat([torch.full((pn*pn,), i) for i, pn in enumerate(self.patch_nums)]).view(1, self.L, 1)
         dT = d.transpose(1, 2)    # dT: 11L
         lvl_1L = dT[:, 0].contiguous()
@@ -201,7 +202,10 @@ class VAR(nn.Module):
         :return: logits BLV, V is vocab_size
         """
         bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)
-        B = x_BLCv_wo_first_l.shape[0]
+        B = x_BLCv_wo_first_l.shape[0] # (B, L_without_SOS, Cvae)
+
+        # Temporarily disables automatic mixed precision (AMP).
+        # Forces everything inside to run in full float32.
         with torch.cuda.amp.autocast(enabled=False):
             label_B = torch.where(torch.rand(B, device=label_B.device) < self.cond_drop_rate, self.num_classes, label_B)
             sos = cond_BD = self.class_emb(label_B)
@@ -236,7 +240,7 @@ class VAR(nn.Module):
                     if p.requires_grad:
                         s += p.view(-1)[0] * 0
                 x_BLC[0, 0, 0] += s
-        return x_BLC    # logits BLV, V is vocab_size
+        return x_BLC, self.attn_bias_for_masking    # logits BLV, V is vocab_size
     
     def init_weights(self, init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=0.02, conv_std_or_gain=0.02):
         if init_std < 0: init_std = (1 / self.C / 3) ** 0.5     # init_std < 0: automated

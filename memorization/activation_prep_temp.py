@@ -82,12 +82,14 @@ def main():
         num_classes=1000, depth=args.model_depth, shared_aln=False,
     )
 
+    # the attention mask has been tailored according to unit_mem attention.
+    # HENCE, remove it from the saved checkpoint, so that it doesn't override the correct one.
+    ckpt = torch.load(os.path.join(PROJECT_ROOT, f"memorization/checkpoints/var_d{args.model_depth}.pth"), map_location='cpu')
+    ckpt.pop('attn_bias_for_masking', None)
+    var.load_state_dict(ckpt, strict=False)
+
     vae.load_state_dict(torch.load(
         os.path.join(PROJECT_ROOT, "memorization/checkpoints/vae_ch160v4096z32.pth"),
-        map_location="cpu"
-    ))
-    var.load_state_dict(torch.load(
-        os.path.join(PROJECT_ROOT, f"memorization/checkpoints/var_d{args.model_depth}.pth"),
         map_location="cpu"
     ))
 
@@ -181,7 +183,6 @@ def main():
 
     num_blocks = len(var.blocks)
     begin_ends = var.begin_ends  # token ranges per scale
-    num_scales = len(begin_ends)
 
     # ---------------------------
     # Temporary hook buffers:
@@ -189,24 +190,14 @@ def main():
     # augmentations, each block accumulates `num_augmentations` tensors which
     # we then mean-reduce (and take abs) before saving.
     # ---------------------------
-    # Per-block, per-scale activation buffers aggregate across augmentations:
-    fc1_act_batch_acts  = [[[] for _ in range(num_scales)] for _ in range(num_blocks)]
-    # Track the currently running scale for hooks to reference.
-    cur_scale = None
+    # Per-block activation buffers aggregate across augmentations:
+    fc1_act_batch_acts  = [[] for _ in range(num_blocks)]
     
     
     def make_fc1_act_hook(bi):
-        # Capture fc1 activation, reduce to the current scale's token range, append (B, C).
-        def hook(module, input, output):
-            nonlocal cur_scale
-            if cur_scale is None:
-                return
-            out = output.detach().to(torch.float32)  # compute reduction in fp32
-            bg, ed_s = begin_ends[cur_scale]
-            # out shape expected: (B, L, C) with L == ed_s
-            act_scale_BC = out[:, bg:ed_s, :].mean(dim=1).to(torch.float16).cpu()
-            fc1_act_batch_acts[bi][cur_scale].append(act_scale_BC)
-        return hook
+        # lambda is a function that takes (module, input, output) and appends output.detach() to a list.
+        # note: activations can stay in CPU.
+        return lambda module, input, output: fc1_act_batch_acts[bi].append(output.detach().to(torch.float16).cpu())
 
     
 
@@ -221,12 +212,40 @@ def main():
         ]
 
     # ---------------------------
-    # Helper: aggregate a single scale from token activations
+    # Helper: token → scale aggregation
     # ---------------------------
-    def aggregate_single_scale_ABLC(x_ABLC, s):
-        """x_ABLC: (A, B, L, C) with L == begin_ends[s][1]. Returns (A, B, C) for scale s."""
-        bg, ed_s = begin_ends[s]
-        return x_ABLC[:, :, bg:ed_s, :].mean(dim=2)
+    def aggregate_over_scales_ABLC(x, begin_ends):
+        """
+        Aggregate activations over tokens belonging to each scale.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Shape (A, B, L, C)
+            A = #augmentations
+            B = batch size
+            L = number of tokens
+            C = hidden dim
+
+        begin_ends : list of (int, int)
+            Token ranges for each scale.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape (A, B, S, C)
+            S = number of scales
+        """
+        # For each scale, average over its token range
+        # result per scale: (A, B, C)
+        per_scale = [
+            x[:, :, bg:ed, :].mean(dim=2)
+            for (bg, ed) in begin_ends
+        ]
+
+        # Stack along scale dimension
+        # (A, B, S, C)
+        return torch.stack(per_scale, dim=2)
     
     
     # Use rank-specific subfolders to avoid filename collisions across ranks.
@@ -237,10 +256,7 @@ def main():
     
     # create sub-folders for each block
     for bi in range(num_blocks):
-        base = os.path.join(fc1_act_folder, f"block_{bi}")
-        os.makedirs(base, exist_ok=True)
-        for s in range(num_scales):
-            os.makedirs(os.path.join(base, f"scale_{s}"), exist_ok=True)
+        os.makedirs(os.path.join(fc1_act_folder, f"block_{bi}"), exist_ok=True)
         
     # ---------------------------
     # Augmentation pipeline (moved from dataset into script)
@@ -269,43 +285,54 @@ def main():
     with torch.no_grad():
         for batch_idx, (images_list, labels, img_indices) in enumerate(loader):
             # images_list: List[PIL.Image]; labels: Tensor[long]
-            # Run multiple augmentations, per-scale constrained forward, collect activations via hooks.
+            # Run multiple augmentations, collect activations via hooks.
             for aug_i in range(args.num_augmentations):
                 # Apply VAR-style augmentation to each image in the batch
                 images_aug = torch.stack([aug_transform(img) for img in images_list], dim=0).to(args.device)
                 labels_dev = labels.to(args.device)
 
-                # Prepare indices once per augmentation
+                # Prepare VAE embeddings for teacher-forcing
                 indices = var.vae_proxy[0].img_to_idxBl(images_aug)
+                emb = torch.cat(
+                    [var.vae_quant_proxy[0].embedding(idx) for idx in indices[1:]],
+                    dim=1
+                )
 
-                # Loop over scales and run the constrained forward; hooks reduce to (B, C) per block
-                for s in range(num_scales):
-                    cur_scale = s
-                    _ = var.forward_unitmem_prev_scale_only(label_B=labels_dev, idx_list=indices, s=s)
-                cur_scale = None
+                # Forward pass (teacher forcing): hooks record activations
+                _ = var(label_B=labels_dev, x_BLCv_wo_first_l=emb)
+                if dist.is_master():
+                    print(len(fc1_act_batch_acts[0]), fc1_act_batch_acts[0][0].shape)
+                    print(fc1_act_batch_acts[0][0].device)  # Debug: check hook activations
                 
             # After num_augmentations forward passes, average activations over augmentations
             # and take absolute value before aggregating over scales and saving.
             for bi in range(num_blocks):
-                # Save per-scale activations averaged over augmentations.
-                for s in range(num_scales):
-                    acts_list = fc1_act_batch_acts[bi][s]
-                    if len(acts_list) == 0:
-                        continue
-                    acts_aug_BC = torch.stack(acts_list, dim=0)  # (A, B, C)
-                    acts_abs = acts_aug_BC.abs()
-                    mean_aug_BC = acts_abs.mean(dim=0)  # (B, C)
+                # fc1_act_batch_acts[bi]: List[num_augmentations x Tensor(B,L,C)] on CPU
+                if len(fc1_act_batch_acts[bi]) == 0:
+                    continue
 
-                    torch.save(
-                        {
-                            "indices": img_indices.cpu(),
-                            "scale": s,
-                            "activations": mean_aug_BC,
-                        },
-                        f"{fc1_act_folder}/block_{bi}/scale_{s}/batch{batch_idx}.pt"
-                    )
-                    # Clear buffer for next batch
-                    fc1_act_batch_acts[bi][s].clear()
+                # Stack along augmentation dimension, compute mean in float32 for stability
+                # change from fc1_act_batch_acts[bi]: List[num_augmentations x Tensor(B,L,C)] to (num_augmentations, B, L, C)
+                acts_aug = torch.stack(fc1_act_batch_acts[bi], dim=0)  
+                if dist.is_master():
+                    print(acts_aug.shape)  # Debug: check shape after stacking
+                acts_abs = acts_aug.abs() # take the absolute value    
+                mean_over_scale = aggregate_over_scales_ABLC(acts_abs, begin_ends)
+                # mean over augmentations
+                mean_aug = mean_over_scale.mean(dim=0)   # (B, S, C)
+
+                # Aggregate token activations into per-scale activations and save
+                torch.save(
+                    {
+                        "indices": img_indices.cpu(),
+                        "activations": mean_aug,
+                    },
+                    
+                    f"{fc1_act_folder}/block_{bi}/batch{batch_idx}.pt"
+                )
+
+                # Clear buffer for next batch
+                fc1_act_batch_acts[bi].clear()
 
             # ----------------------------------------------
             # Progress prints
