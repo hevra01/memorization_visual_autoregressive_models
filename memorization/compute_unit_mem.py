@@ -1,5 +1,6 @@
 import os
 import torch
+import argparse
 
 def compute_unitmem(mean_max_activations_dict, eps=1e-8):
     """
@@ -48,12 +49,15 @@ def compute_unitmem(mean_max_activations_dict, eps=1e-8):
 
     return unitmem_dict
 
-def main():
-    mean_activation_over_augmentations_dir = (
-        "/scratch/inf0/user/hpetekka/var_mem/output_activations_corrected_test/combined"
-    )
+def parse_args():
+    p = argparse.ArgumentParser(description="Prepare VAR activations for UnitMem")
+    p.add_argument("--mean_activation_over_augmentations_dir", type=str, default="/scratch/inf0/user/hpetekka/var_mem/output_activation_all_prev_scales/combined")
+    return p.parse_args()
 
-    keys = ["fc1", "fc1_act", "fc2", "q", "k", "v", "attn_proj"]
+def main():
+    args = parse_args()
+    mean_activation_over_augmentations_dir = args.mean_activation_over_augmentations_dir
+
     keys = ["fc1_act"]
     # Structure:
     # mean_max_activations_dict[key][block][scale] -> (C, 2) [max, mean]
@@ -99,8 +103,8 @@ def main():
         eps=1e-8
     )
 
-    torch.save(unitmem_dict, "unitmem_scores_corrected.pt")
-    print("Saved UnitMem scores to unitmem_scores_corrected.pt")
+    torch.save(unitmem_dict, "unitmem_scores_all_prev.pt")
+    print("Saved UnitMem scores to unitmem_scores_all_prev.pt")
     
 if __name__ == "__main__":
     main()

@@ -3,11 +3,8 @@
 This script combines these batches into single tensors per block, per component.
 """
 
+import argparse
 import torch
-from models import VQVAE, build_vae_var
-from memorization.data_prep.subset_imagenet import get_balanced_imagenet_dataset
-from pathlib import Path
-import shutil
 from glob import glob
 import os
 
@@ -66,9 +63,15 @@ def combine_ranks_for_block(
 
     return sorted_activations, sorted_indices
 
-def main():
+def parse_args():
+    p = argparse.ArgumentParser(description="Prepare VAR activations for UnitMem")
+    p.add_argument("--mean_activation_over_augmentations_dir", type=str, default="/scratch/inf0/user/hpetekka/var_mem/output_activation_all_prev_scales")
+    return p.parse_args()
 
-    main_dir = "/scratch/inf0/user/hpetekka/var_mem/output_activations_corrected_test"
+def main():
+    args = parse_args()
+
+    main_dir = args.mean_activation_over_augmentations_dir
     layer = "fc1_act"
 
     final_dir = os.path.join(main_dir, "combined", layer)
