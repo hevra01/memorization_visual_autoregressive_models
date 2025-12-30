@@ -111,10 +111,15 @@ class VAR(nn.Module):
         dT = d.transpose(1, 2)    # dT: 11L
         lvl_1L = dT[:, 0].contiguous()
         self.register_buffer('lvl_1L', lvl_1L)
-        prev_lvl = (d == (dT + 1))                # keys at level s-1
-        first_lvl = (d == 0) & (dT == 0)          # level-0 queries attend to level-0 keys
-        mask_bool = prev_lvl | first_lvl
-        attn_bias_for_masking = torch.where(mask_bool, 0., -torch.inf).reshape(1, 1, self.L, self.L)
+
+        # if you want to attend to only the previous scale:
+        # prev_lvl = (d == (dT + 1))                # keys at level s-1
+        # first_lvl = (d == 0) & (dT == 0)          # level-0 queries attend to level-0 keys
+        # mask_bool = prev_lvl | first_lvl
+        # attn_bias_for_masking = torch.where(mask_bool, 0., -torch.inf).reshape(1, 1, self.L, self.L)
+
+        # if you want to attend to all previous scales:
+        attn_bias_for_masking = torch.where(d >= dT, 0., -torch.inf).reshape(1, 1, self.L, self.L)
         self.register_buffer('attn_bias_for_masking', attn_bias_for_masking.contiguous())
         
         # 6. classifier head
@@ -240,7 +245,7 @@ class VAR(nn.Module):
                     if p.requires_grad:
                         s += p.view(-1)[0] * 0
                 x_BLC[0, 0, 0] += s
-        return x_BLC, self.attn_bias_for_masking    # logits BLV, V is vocab_size
+        return x_BLC  # logits BLV, V is vocab_size
     
     def init_weights(self, init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=0.02, conv_std_or_gain=0.02):
         if init_std < 0: init_std = (1 / self.C / 3) ** 0.5     # init_std < 0: automated

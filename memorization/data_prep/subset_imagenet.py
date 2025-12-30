@@ -5,9 +5,8 @@ This file will create a subset of ImageNet dataset to be used for testing memori
 from collections import defaultdict
 import os
 import random
-from torch.utils.data import DataLoader
+import torch
 from torchvision.datasets import ImageFolder
-from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as T
 from torchvision.transforms import InterpolationMode
 from pathlib import Path
@@ -91,6 +90,24 @@ def get_balanced_subset(
         selected_indices.extend(leftovers[:remaining])
 
     return Subset(dataset, selected_indices)
+
+# ---------------------------
+# Dataset with index tracking
+# ---------------------------
+class IndexedDataset(torch.utils.data.Dataset):
+    """
+    Wraps an existing dataset so that __getitem__ returns (img, label, index).
+    The index refers to the position in the wrapped dataset (after subsetting).
+    """
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        img, label = self.dataset[idx]
+        return img, label, idx
 
 
 def get_balanced_imagenet_dataset(
