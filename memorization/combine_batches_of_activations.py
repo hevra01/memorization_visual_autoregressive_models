@@ -1,67 +1,99 @@
 """
-(activation_prep.py) script prepared the activations per batch, per block, per component due to limited storage.
+(activation_prep.py) script prepared the activations per batch, per block due to limited storage.
 This script combines these batches into single tensors per block, per component.
 """
 
-import os
+import torch
+from models import VQVAE, build_vae_var
+from memorization.data_prep.subset_imagenet import get_balanced_imagenet_dataset
 from pathlib import Path
 import shutil
-import torch
-import wandb
+from glob import glob
+import os
+
+
+def combine_ranks_for_block(
+    main_dir,
+    layer,
+    block_name,
+    expected_num_images=12800,
+):
+    """
+    Combine activation files from all ranks for one block and one layer.
+
+    Produces a tensor of shape:
+        (num_images, S, C)
+    ordered by dataset index.
+    """
+
+    all_indices = []
+    all_activations = []
+
+    # Iterate over all rank directories (rank0, rank1, ...)
+    for rank_dir in sorted(os.listdir(main_dir)):
+        rank_path = os.path.join(main_dir, rank_dir, layer, block_name)
+
+        if not os.path.isdir(rank_path):
+            continue
+
+        # Load all batch files from this rank
+        batch_files = sorted(glob(os.path.join(rank_path, "batch*.pt")))
+
+        for bf in batch_files:
+            data = torch.load(bf, map_location="cpu")
+
+            # data["indices"]: (B,)
+            # data["activations"]: (B, S, C)
+            all_indices.append(data["indices"])
+            all_activations.append(data["activations"])
+
+    # Concatenate everything
+    all_indices = torch.cat(all_indices, dim=0)        # (N,)
+    all_activations = torch.cat(all_activations, dim=0)  # (N, S, C)
+
+    assert all_indices.shape[0] == all_activations.shape[0], \
+        "Mismatch between indices and activations!"
+
+    # Sort by dataset index
+    sorted_indices, sort_order = torch.sort(all_indices)
+    sorted_activations = all_activations[sort_order]
+
+    # Sanity checks
+    assert sorted_indices.unique().numel() == sorted_indices.numel(), \
+        "Duplicate indices detected!"
+    assert sorted_indices.numel() == expected_num_images, \
+        f"Expected {expected_num_images} images, got {sorted_indices.numel()}"
+
+    return sorted_activations, sorted_indices
 
 def main():
 
-    # Setup wandb
-    # Initialize Weights & Biases for logging
-    wandb.init(project="VaR_memorization", name="combine_batches_of_activations")
-    
-    main_dir = "/scratch/inf0/user/hpetekka/var_mem/output_activations_corrected_abs/"
-    # "/scratch/inf0/user/hpetekka/var_mem/output_activations/0/attn_proj"
-    # has block_0, block_1, ..., block_15 folders with attention projection activations saved as batch0.pt, batch1.pt, batch159.pt 
-    # combine these into a single tensor per block.
+    main_dir = "/scratch/inf0/user/hpetekka/var_mem/output_activations_corrected_test"
+    layer = "fc1_act"
 
-    # loop over runs, which are for different augmented versions of the same data points.
-    for i in range(10):
-        # for each version, loop over activation types
-        for dir in (
-            #f"{main_dir}/{i}/fc1",
-            f"{main_dir}/{i}/fc1_act",
-            # f"{main_dir}/{i}/fc2",
-            # f"{main_dir}/{i}/q",
-            # f"{main_dir}/{i}/k",
-            # f"{main_dir}/{i}/v",
-            # f"{main_dir}/{i}/attn_proj"
-        ):
-            # for each activation type, loop over blocks, where each block corresponds to a scale.
-            for block_i in range(0,16):
-                block_folder = os.path.join(dir, f"block_{block_i}")
-                all_batches = []
-                for batch_i in range(116):
-                    batch_file = os.path.join(block_folder, f"batch{batch_i}.pt")
-                    batch_tensor = torch.load(batch_file)  # shape: (batch_size, num_tokens, hidden_dim)
-                    all_batches.append(batch_tensor)
-                # concatenate all batches
-                block_tensor = torch.cat(all_batches, dim=0)  # shape: (num_data_points, num_tokens, hidden_dim)
-                # save the combined tensor
-                combined_file = os.path.join(dir, f"block_{block_i}_combined.pt")
-                torch.save(block_tensor, combined_file)
-                print(f"Saved combined activations for {dir}, block {block_i} to {combined_file}")
+    final_dir = os.path.join(main_dir, "combined", layer)
+    os.makedirs(final_dir, exist_ok=True)
 
-    
-    base_dirs = [
-    "fc1", "fc1_act", "fc2",
-    "q", "k", "v", "attn_proj"
-    ]
+    for block_id in range(16):
+        block_name = f"block_{block_id}"
 
-    base_dirs = ["fc1_act",]
+        activations, indices = combine_ranks_for_block(
+            main_dir=main_dir,
+            layer=layer,
+            block_name=block_name,
+            expected_num_images=12800,
+        )
 
-    for i in range(0, 10):
-        for subdir in base_dirs:
-            dir_path = Path(f"{main_dir}/{i}/{subdir}")
+        # activations: (12800, 10, 4096)
+        torch.save(
+            {
+                "activations": activations,
+                "indices": indices,  # optional but nice to keep
+            },
+            os.path.join(final_dir, f"{block_name}.pt")
+        )
 
-            for p in dir_path.iterdir():
-                if p.is_dir():
-                    shutil.rmtree(p)
+        print(f"Saved combined {layer}/{block_name}: {activations.shape}")
 
 if __name__ == "__main__":
     main()
